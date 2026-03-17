@@ -1,3 +1,7 @@
 .env
 .venv
 *.pkl
+ncu_index.pkl
+*.pkl
+*.jsonl
+.env
