@@ -1,0 +1,114 @@
+{
+  "E": {
+    "en": "Engineering Building #1 (工程一館)",
+    "zh": "工程一館"
+  },
+  "E1": {
+    "en": "Engineering Building #2 / EECS Office (工程二館)",
+    "zh": "工程二館（資電學院辦公室）"
+  },
+  "E2": {
+    "en": "Engineering Building #3 (工程三館)",
+    "zh": "工程三館"
+  },
+  "E3": {
+    "en": "Engineering Building #4 (工程四館)",
+    "zh": "工程四館"
+  },
+  "E4": {
+    "en": "Engineering Building #5 (工程五館)",
+    "zh": "工程五館"
+  },
+  "E5": {
+    "en": "Engineering Building #6 (工程六館)",
+    "zh": "工程六館"
+  },
+  "E6": {
+    "en": "Engineering Building #7 (工程七館)",
+    "zh": "工程七館"
+  },
+  "S": {
+    "en": "Science Building (科學館)",
+    "zh": "科學館"
+  },
+  "S2": {
+    "en": "Science Building #3 (科學三館)",
+    "zh": "科學三館"
+  },
+  "S3": {
+    "en": "Science Building #4 (科學四館)",
+    "zh": "科學四館"
+  },
+  "M": {
+    "en": "Management Building (管理學院大樓)",
+    "zh": "管理學院大樓"
+  },
+  "H": {
+    "en": "Humanities Building (人文館)",
+    "zh": "人文館"
+  },
+  "HA": {
+    "en": "Humanities Building A (人文館A棟)",
+    "zh": "人文館A棟"
+  },
+  "HB": {
+    "en": "Humanities Building B (人文館B棟)",
+    "zh": "人文館B棟"
+  },
+  "10": {
+    "en": "Baisha Building (白沙大樓)",
+    "zh": "白沙大樓"
+  },
+  "11": {
+    "en": "Mingde Hall (明德館)",
+    "zh": "明德館"
+  },
+  "12": {
+    "en": "Zhishan Hall (至善館)",
+    "zh": "至善館"
+  },
+  "13": {
+    "en": "Jieying Hall (擷英館)",
+    "zh": "擷英館"
+  },
+  "14": {
+    "en": "Hongdao Hall (弘道館)",
+    "zh": "弘道館"
+  },
+  "15": {
+    "en": "Yihui Hall (藝薈館)",
+    "zh": "藝薈館"
+  },
+  "16": {
+    "en": "Shengyang Hall (聲洋館)",
+    "zh": "聲洋館"
+  },
+  "ST": {
+    "en": "Student Activity Center (學生活動中心)",
+    "zh": "學生活動中心"
+  },
+  "LI": {
+    "en": "Library (圖書館)",
+    "zh": "圖書館"
+  },
+  "GY": {
+    "en": "Gymnasium (體育館)",
+    "zh": "體育館"
+  },
+  "AT": {
+    "en": "Astronomical Observatory (天文台)",
+    "zh": "天文台"
+  },
+  "R": {
+    "en": "Ren-Sheng Building (仁生館)",
+    "zh": "仁生館"
+  },
+  "C": {
+    "en": "Computer Center (電算中心)",
+    "zh": "電算中心"
+  },
+  "EL": {
+    "en": "Language Center (語言中心)",
+    "zh": "語言中心"
+  }
+}
