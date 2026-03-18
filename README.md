@@ -35,7 +35,7 @@ Activate the environment **every time** you open a new terminal session for this
   ```
 - **macOS / Linux:**
   ```bash
-  source .venv/bin/activate
+  source .venv/Scripts/activate
   ```
 
 > **Tip:** You’ll know it’s active when you see `(.venv)` at the start of your terminal prompt.
