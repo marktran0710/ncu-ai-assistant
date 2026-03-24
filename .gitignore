@@ -5,3 +5,4 @@ ncu_index.pkl
 *.pkl
 *.jsonl
 .env
+__pycache__

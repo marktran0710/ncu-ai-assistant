@@ -1,0 +1,72 @@
+{
+  "1": {
+    "time": "08:00-08:50",
+    "label_en": "Period 1",
+    "label_zh": "第1節"
+  },
+  "2": {
+    "time": "09:00-09:50",
+    "label_en": "Period 2",
+    "label_zh": "第2節"
+  },
+  "3": {
+    "time": "10:00-10:50",
+    "label_en": "Period 3",
+    "label_zh": "第3節"
+  },
+  "4": {
+    "time": "11:00-11:50",
+    "label_en": "Period 4",
+    "label_zh": "第4節"
+  },
+  "Z": {
+    "time": "12:00-12:50",
+    "label_en": "Period Z (noon)",
+    "label_zh": "第Z節（午休）"
+  },
+  "5": {
+    "time": "13:00-13:50",
+    "label_en": "Period 5",
+    "label_zh": "第5節"
+  },
+  "6": {
+    "time": "14:00-14:50",
+    "label_en": "Period 6",
+    "label_zh": "第6節"
+  },
+  "7": {
+    "time": "15:00-15:50",
+    "label_en": "Period 7",
+    "label_zh": "第7節"
+  },
+  "8": {
+    "time": "16:00-16:50",
+    "label_en": "Period 8",
+    "label_zh": "第8節"
+  },
+  "9": {
+    "time": "17:00-17:50",
+    "label_en": "Period 9",
+    "label_zh": "第9節"
+  },
+  "A": {
+    "time": "18:00-18:50",
+    "label_en": "Period A",
+    "label_zh": "第A節"
+  },
+  "B": {
+    "time": "19:00-19:50",
+    "label_en": "Period B",
+    "label_zh": "第B節"
+  },
+  "C": {
+    "time": "20:00-20:50",
+    "label_en": "Period C",
+    "label_zh": "第C節"
+  },
+  "D": {
+    "time": "21:00-21:50",
+    "label_en": "Period D",
+    "label_zh": "第D節"
+  }
+}
