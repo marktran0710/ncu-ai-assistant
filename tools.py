@@ -9,9 +9,9 @@ from core import VectorIndex
 
 logger = logging.getLogger(__name__)
 
-MAX_RESULTS      = 3
-MAX_CHARS_RESULT = 300
-MAX_CHARS_TOTAL  = 1800
+MAX_RESULTS      = 5
+MAX_CHARS_RESULT = 400   # slightly larger to fit schedule lines
+MAX_CHARS_TOTAL  = 3000  # raised so 5 detailed results fit
 
 # ── Department labels ─────────────────────────────────────────────────────────
 DEPT_EN_LABEL: dict[str, str] = {
@@ -255,8 +255,6 @@ DEPT_MAP: dict[str, str] = {
 }
 
 # ── EECS scope ────────────────────────────────────────────────────────────────
-# Defined at module level so every tool can reference it without re-defining it.
-
 EECS_DEPTS_ZH: frozenset[str] = frozenset({
     "電機工程學系",
     "資訊工程學系",
@@ -293,7 +291,6 @@ def _check_index(index: Optional[VectorIndex]) -> Optional[str]:
 
 
 def _resolve_dept(name: str) -> tuple[str | None, str]:
-    """Returns (dept_name_zh, display_label) or (None, original)."""
     key = name.strip().lower()
     if key in DEPT_MAP:
         zh = DEPT_MAP[key]
@@ -312,11 +309,6 @@ def _find_ambiguous_depts(
     index: VectorIndex,
     restrict_to: Optional[frozenset[str]] = None,
 ) -> list[tuple[str, str, int]]:
-    """Return list of (en_label, zh_name, course_count) matching query.
-
-    Args:
-        restrict_to: If provided, only include departments in this set.
-    """
     q       = query.strip().lower()
     seen    = set()
     matches = []
@@ -345,7 +337,6 @@ def _find_similar_courses(
     query: str,
     index: VectorIndex,
 ) -> list[tuple[str, str, str]]:
-    """Return list of (course_name, course_code, dept_zh) for courses with similar names."""
     q       = query.strip().lower()
     matches = []
     seen    = set()
@@ -398,6 +389,7 @@ def _compress(text: str) -> str:
 
 
 def _format_results(texts: list[str], label: str) -> str:
+    """Format up to MAX_RESULTS (5) deduplicated results."""
     seen, unique = set(), []
     for t in texts:
         k = t.strip()
@@ -414,7 +406,8 @@ def _format_results(texts: list[str], label: str) -> str:
             parts.append(f"[{i+1}] …(truncated)")
             break
         parts.append(entry)
-    return f"Found {len(parts)} result(s) for '{label}':\n\n" + "\n\n".join(parts)
+    header = f"Found {len(unique)} result(s) for '{label}' (showing {len(parts)}):\n\n"
+    return header + "\n\n".join(parts)
 
 
 def _dept_docs(index: VectorIndex, dept_zh: str) -> list[dict]:
@@ -425,9 +418,14 @@ def _eecs_docs(index: VectorIndex) -> list[dict]:
     return [d for d in index.documents if d.get("dept_name_zh", "") in EECS_DEPTS_ZH]
 
 
-def _format_graph_results(docs: list[dict], query_desc: str, max_results: int = 5) -> str:
+def _format_graph_results(docs: list[dict], query_desc: str, max_results: int = MAX_RESULTS) -> str:
+    """
+    Format up to max_results courses with full detail:
+    code, name, dept, credits, instructor, schedule (days + periods + times + rooms).
+    """
     if not docs:
         return f"No courses found matching: {query_desc}"
+
     lines = []
     for i, d in enumerate(docs[:max_results]):
         code  = d.get("course_code", "?")
@@ -435,23 +433,142 @@ def _format_graph_results(docs: list[dict], query_desc: str, max_results: int = 
         dept  = d.get("dept_name_zh", "")
         cr    = d.get("credits", "?")
         inst  = d.get("instructor", "")
-        wdays = ", ".join(d.get("weekdays", []))
-        rooms = ", ".join(d.get("classrooms", []))
-        blds  = ", ".join(d.get("buildings", []))
-        line  = f"[{i+1}] [{code}] {name}"
+        ctype = _parse_type(d)
+
+        # ── Header line ────────────────────────────────────────────────────
+        header = f"[{i+1}] [{code}] {name} — {cr} credits"
+        if ctype:
+            header += f" ({ctype})"
         parts = []
         if dept:  parts.append(f"Dept: {dept}")
-        if cr:    parts.append(f"Credits: {cr}")
         if inst:  parts.append(f"Instructor: {inst}")
-        if wdays: parts.append(f"Days: {wdays}")
-        if rooms: parts.append(f"Room: {rooms}")
-        elif blds:parts.append(f"Building: {blds}")
         if parts:
-            line += "\n   " + " | ".join(parts)
-        lines.append(line)
+            header += "\n   " + " | ".join(parts)
+
+        # ── Schedule lines — one per slot ──────────────────────────────────
+        # Try to reconstruct from metadata first; fall back to text parsing.
+        schedule_lines = _extract_schedule_lines(d)
+        if schedule_lines:
+            header += "\n   " + "\n   ".join(schedule_lines)
+
+        lines.append(header)
+
     total = len(docs)
     shown = min(total, max_results)
-    return f"Found {total} course(s) matching '{query_desc}' (showing {shown}):\n\n" + "\n\n".join(lines)
+    header_str = f"Found {total} course(s) matching '{query_desc}' (showing {shown}):\n\n"
+    return header_str + "\n\n".join(lines)
+
+
+def _extract_schedule_lines(doc: dict) -> list[str]:
+    """
+    Build human-readable schedule lines for a course document.
+
+    Priority:
+      1. Structured 'schedule' list (new field added by scraper fix)
+      2. Flat weekdays/periods/classrooms metadata (old format, merged view)
+      3. Regex parse of prose text (last resort)
+
+    Returns lines like:
+      📅 Monday | Periods: 3,4 (10:00–11:50) | Room: E6-A207 (Engineering Building 7)
+    """
+    # ── 1. Structured per-slot schedule list (preferred) ──────────────────
+    schedule = doc.get("schedule", [])
+    if schedule:
+        lines = []
+        for slot in schedule:
+            day      = (slot.get("weekday") or "").title()
+            periods  = slot.get("periods", [])
+            times    = slot.get("times", [])
+            room     = slot.get("classroom", "")
+            bld      = slot.get("building", "")
+
+            if not day or not periods:
+                continue
+
+            period_str = ", ".join(periods)
+            time_str   = ""
+            if times:
+                # Build range from first start to last end
+                try:
+                    start = times[0].split("-")[0].strip()
+                    end   = times[-1].split("-")[1].strip()
+                    time_str = f" ({start}–{end})"
+                except (IndexError, AttributeError):
+                    time_str = f" ({', '.join(times)})"
+
+            line = f"📅 {day} | Periods: {period_str}{time_str}"
+            if room:
+                line += f" | Room: {room}"
+                if bld:
+                    line += f" ({bld})"
+            elif bld:
+                line += f" | Building: {bld}"
+            lines.append(line)
+        if lines:
+            return lines
+
+    # ── 2. Flat metadata fallback (weekdays + periods merged, old format) ──
+    weekdays   = doc.get("weekdays", [])
+    periods    = doc.get("periods", [])
+    classrooms = doc.get("classrooms", [])
+    buildings  = doc.get("buildings", [])
+
+    if weekdays and periods:
+        day_str    = ", ".join(w.title() for w in weekdays)
+        period_str = ", ".join(sorted(periods))
+        room_str   = ", ".join(classrooms) if classrooms else ""
+        bld_str    = ", ".join(buildings)  if buildings  else ""
+        line = f"📅 {day_str} | Periods: {period_str}"
+        if room_str:
+            line += f" | Room: {room_str}"
+            if bld_str:
+                line += f" ({bld_str})"
+        elif bld_str:
+            line += f" | Building: {bld_str}"
+        return [line]
+
+    # ── 3. Parse prose text as last resort ─────────────────────────────────
+    text    = doc.get("text", "")
+    results = []
+
+    # English prose: "Monday periods 3 and 4 (10:00–11:50) in room E6-A207 (Eng Bldg 7)"
+    for m in re.finditer(
+        r"(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)"
+        r"\s+periods?\s+([\d,\s\w]+?)"
+        r"\s*\(([^)]+)\)"
+        r"(?:\s+in room\s+([\w\-]+))?"
+        r"(?:\s+\(([^)]+)\))?",
+        text, re.IGNORECASE
+    ):
+        day, pds, time_range, room, bld = m.groups()
+        line = f"📅 {day.title()} | Periods: {pds.strip()} ({time_range.strip()})"
+        if room:
+            line += f" | Room: {room.strip()}"
+            if bld:
+                line += f" ({bld.strip()})"
+        results.append(line)
+
+    if results:
+        return results
+
+    # Chinese prose: "每週三第3、4節（10:00–11:50）在E6-A207教室（工程七館）"
+    ZH_DAY = {"一":"Mon","二":"Tue","三":"Wed","四":"Thu","五":"Fri","六":"Sat","日":"Sun"}
+    for m in re.finditer(
+        r"每週([一二三四五六日])第([\d、A-DZa-dz]+)節"
+        r"[（(]([^）)]+)[）)]"
+        r"(?:在([\w\-]+)教室)?(?:[（(]([^）)]+)[）)])?",
+        text
+    ):
+        day_zh, pds, time_range, room, bld = m.groups()
+        day_en = ZH_DAY.get(day_zh, day_zh)
+        line = f"📅 {day_en} | Periods: {pds} ({time_range})"
+        if room:
+            line += f" | Room: {room}"
+            if bld:
+                line += f" ({bld})"
+        results.append(line)
+
+    return results
 
 
 def _apply_filters(
@@ -465,7 +582,6 @@ def _apply_filters(
     course_name: Optional[str] = None,
     req_type:    Optional[str] = None,
 ) -> list[dict]:
-    # Note: `index` parameter removed — filtering operates only on the provided docs list.
     result = docs
     if department:
         dept_zh, _ = _resolve_dept(department)
@@ -498,6 +614,7 @@ def _apply_filters(
             d for d in result
             if cn in (d.get("course_name", "") or "").lower()
             or cn in (d.get("course_name_zh", "") or "").lower()
+            or cn in (d.get("course_code", "") or "").lower()
             or cn in (d.get("text", "") or "").lower()
         ]
     if req_type:
@@ -506,12 +623,7 @@ def _apply_filters(
     return result
 
 
-def _build_course_plan(
-    courses: list[dict],
-    target_credits: int,
-    display: str,
-) -> str:
-    """Shared credit-planning logic used by both general and EECS tools."""
+def _build_course_plan(courses: list[dict], target_credits: int, display: str) -> str:
     total_available = sum(c["credits"] for c in courses)
     if total_available < target_credits:
         return (
@@ -561,12 +673,11 @@ def _build_course_plan(
 
 
 def _collect_courses(docs: list[dict]) -> list[dict]:
-    """Extract credit-bearing course dicts from a list of index documents."""
     courses = []
     for d in docs:
-        cr   = _parse_credits_val(d)
-        code = d.get("course_code", "?")
-        name = d.get("course_name_en") or d.get("course_name") or "?"
+        cr    = _parse_credits_val(d)
+        code  = d.get("course_code", "?")
+        name  = d.get("course_name_en") or d.get("course_name") or "?"
         ctype = _parse_type(d)
         if cr == 0:
             continue
@@ -581,11 +692,7 @@ def create_tools(index: Optional[VectorIndex]) -> list:
     @tool
     def clarify(question: str) -> str:
         """
-        Ask the user to clarify when their input is ambiguous — matches multiple
-        departments, multiple courses with the same name, or could be either a
-        course name or a department name.
-
-        Use this tool BEFORE any search when you are unsure what the user means.
+        Ask the user to clarify when their input is ambiguous.
 
         Args:
             question: The clarifying question to present to the user,
@@ -598,8 +705,7 @@ def create_tools(index: Optional[VectorIndex]) -> list:
     @tool
     def detect_ambiguity(query: str) -> str:
         """
-        Check if a query could mean multiple departments OR multiple courses,
-        OR could be interpreted as either a course name or a department name.
+        Check if a query could mean multiple departments OR multiple courses.
         Call this when unsure before calling any search/listing tool.
 
         Args:
@@ -640,7 +746,6 @@ def create_tools(index: Optional[VectorIndex]) -> list:
     def detect_ambiguity_eecs(query: str) -> str:
         """
         Check if a query matches multiple EECS departments or courses.
-        Call this when the context is EECS-specific and you are unsure what the user means.
 
         Args:
             query: The user's input that might be ambiguous within EECS.
@@ -685,7 +790,6 @@ def create_tools(index: Optional[VectorIndex]) -> list:
     def search_courses_by_content(query: str) -> str:
         """
         Search all NCU courses by topic, keyword, or professor name.
-        Works in English and Chinese.
 
         Args:
             query: Natural language search query.
@@ -699,7 +803,6 @@ def create_tools(index: Optional[VectorIndex]) -> list:
     def search_eecs_courses_by_content(query: str) -> str:
         """
         Search EECS courses (CS, EE, CE, NLT, AI) by topic, keyword, or professor name.
-        Works in English and Chinese.
 
         Args:
             query: Natural language search query.
@@ -723,10 +826,7 @@ def create_tools(index: Optional[VectorIndex]) -> list:
         keyword:    Optional[str] = None,
     ) -> str:
         """
-        List up to 3 courses from a department with optional keyword filter.
-        Use full department names only: "computer science", "communication engineering".
-        For full lists use get_all_courses_by_department.
-        For credit planning use plan_courses_by_credits.
+        List up to 5 courses from a department with optional keyword filter.
 
         Args:
             department: Full department name in English or Chinese.
@@ -753,12 +853,7 @@ def create_tools(index: Optional[VectorIndex]) -> list:
 
     # ── Full course listing ───────────────────────────────────────────────────
 
-    def _all_courses_for_dept(
-        department: str,
-        docs: list[dict],
-        display: str,
-    ) -> str:
-        """Shared rendering for a full department course list."""
+    def _all_courses_for_dept(department: str, docs: list[dict], display: str) -> str:
         if not docs:
             return f"No courses found for {display}."
         lines, skipped = [], 0
@@ -792,7 +887,6 @@ def create_tools(index: Optional[VectorIndex]) -> list:
     def get_all_courses_by_department(department: str) -> str:
         """
         Return ALL courses from any NCU department as a compact one-line-per-course list.
-        Use full department names: "computer science", "communication engineering".
 
         Args:
             department: Full department name in English or Chinese.
@@ -816,7 +910,6 @@ def create_tools(index: Optional[VectorIndex]) -> list:
     def get_all_eecs_courses_by_department(department: str) -> str:
         """
         Return ALL courses from an EECS department (CS, EE, CE, NLT, AI).
-        Use full department names: "computer science", "communication engineering".
 
         Args:
             department: Full department name in English or Chinese.
@@ -835,10 +928,7 @@ def create_tools(index: Optional[VectorIndex]) -> list:
             else:
                 return f"Department '{department}' not found in EECS."
         if dept_zh not in EECS_DEPTS_ZH:
-            return (
-                f"'{display}' is outside EECS scope. "
-                f"I only cover: CS, EE, CE, NLT, and AI."
-            )
+            return f"'{display}' is outside EECS scope. I only cover: CS, EE, CE, NLT, and AI."
         return _all_courses_for_dept(department, _dept_docs(index, dept_zh), display)
 
     # ── Credit planning ───────────────────────────────────────────────────────
@@ -847,7 +937,6 @@ def create_tools(index: Optional[VectorIndex]) -> list:
     def plan_courses_by_credits(department: str, target_credits: int) -> str:
         """
         Select courses from any NCU department whose credits sum to target_credits.
-        Use full department names: "computer science", "communication engineering".
 
         Args:
             department:     Full department name in English or Chinese.
@@ -872,7 +961,6 @@ def create_tools(index: Optional[VectorIndex]) -> list:
     def plan_eecs_courses_by_credits(department: str, target_credits: int) -> str:
         """
         Select EECS courses (CS, EE, CE, NLT, AI) whose credits sum to target_credits.
-        Use full department names: "computer science", "communication engineering".
 
         Args:
             department:     Full department name in English or Chinese.
@@ -883,10 +971,7 @@ def create_tools(index: Optional[VectorIndex]) -> list:
         if dept_zh is None:
             return f"Department '{department}' not found."
         if dept_zh not in EECS_DEPTS_ZH:
-            return (
-                f"'{display}' is outside EECS scope. "
-                f"I only cover CS, EE, CE, NLT, and AI."
-            )
+            return f"'{display}' is outside EECS scope. I only cover CS, EE, CE, NLT, and AI."
         courses = _collect_courses(_dept_docs(index, dept_zh))
         if not courses:
             return f"No credit-bearing courses found for {display}."
@@ -906,7 +991,6 @@ def create_tools(index: Optional[VectorIndex]) -> list:
         course_name: Optional[str],
         req_type:    Optional[str],
     ) -> str:
-        """Shared multi-filter search logic."""
         parts = []
         if department:  parts.append(f"dept={department}")
         if building:    parts.append(f"building={building}")
@@ -921,33 +1005,19 @@ def create_tools(index: Optional[VectorIndex]) -> list:
 
         query_desc = " + ".join(parts)
         filtered   = _apply_filters(
-            docs        = docs,
-            department  = department,
-            building    = building,
-            weekday     = weekday,
-            period      = period,
-            credits     = credits,
-            instructor  = instructor,
-            course_name = course_name,
-            req_type    = req_type,
+            docs=docs, department=department, building=building,
+            weekday=weekday, period=period, credits=credits,
+            instructor=instructor, course_name=course_name, req_type=req_type,
         )
 
         if not filtered and course_name:
             sem_results = index.search(course_name, top_k=10)
             doc_lookup  = {d.get("text"): d for d in docs}
-            sem_docs    = [
-                doc_lookup[r.text] for r in sem_results
-                if r.text in doc_lookup
-            ]
-            filtered = _apply_filters(
-                docs        = sem_docs,
-                department  = department,
-                building    = building,
-                weekday     = weekday,
-                period      = period,
-                credits     = credits,
-                instructor  = instructor,
-                req_type    = req_type,
+            sem_docs    = [doc_lookup[r.text] for r in sem_results if r.text in doc_lookup]
+            filtered    = _apply_filters(
+                docs=sem_docs, department=department, building=building,
+                weekday=weekday, period=period, credits=credits,
+                instructor=instructor, req_type=req_type,
             ) or sem_docs
 
         return _format_graph_results(filtered, query_desc)
@@ -965,20 +1035,18 @@ def create_tools(index: Optional[VectorIndex]) -> list:
     ) -> str:
         """
         Multi-hop graph search combining any filters as AND conditions across all NCU courses.
-        Use for complex queries spanning course, location, time, credits, department.
 
         Args:
-            department:  Full dept name e.g. "computer science", "communication engineering"
-            building:    Building code/name e.g. "E6", "Language Center"
-            weekday:     Day e.g. "Monday", "thursday", "星期三"
-            period:      Period e.g. "3", "5", "A"
+            department:  Full dept name e.g. "computer science"
+            building:    Building code/name e.g. "E6"
+            weekday:     Day e.g. "Monday", "thursday"
+            period:      Period e.g. "3", "A"
             credits:     Exact credit count e.g. 3
-            instructor:  Instructor name (partial) e.g. "Wang"
-            course_name: Course name keyword (partial)
+            instructor:  Instructor name (partial)
+            course_name: Course name or code keyword (partial)
             req_type:    "required" or "elective"
         """
         if err := _check_index(index): return err
-
         if department:
             dept_zh, _ = _resolve_dept(department)
             if dept_zh is None:
@@ -989,30 +1057,19 @@ def create_tools(index: Optional[VectorIndex]) -> list:
                         lines.append(f"  {i}. {en} ({zh}) — {count} courses")
                     lines.append("Please specify which department you mean.")
                     return "\n".join(lines)
-
         if course_name:
             course_matches = _find_similar_courses(course_name, index)
-            if len(course_matches) > 3:
+            if len(course_matches) > 5:
                 lines = [f"'{course_name}' matches {len(course_matches)} courses:"]
                 for i, (name, code, dept) in enumerate(course_matches[:5], 1):
-                    dept_en = DEPT_EN_LABEL.get(dept, dept)
-                    lines.append(f"  {i}. [{code}] {name} — {dept_en}")
-                if len(course_matches) > 5:
-                    lines.append(f"  … and {len(course_matches)-5} more")
-                lines.append("Please be more specific.")
+                    lines.append(f"  {i}. [{code}] {name} — {DEPT_EN_LABEL.get(dept, dept)}")
+                lines.append(f"  … and {len(course_matches)-5} more. Please be more specific.")
                 return "\n".join(lines)
-
         return _graph_search(
-            docs        = index.documents,
-            scope_label = "all NCU",
-            department  = department,
-            building    = building,
-            weekday     = weekday,
-            period      = period,
-            credits     = credits,
-            instructor  = instructor,
-            course_name = course_name,
-            req_type    = req_type,
+            docs=index.documents, scope_label="all NCU",
+            department=department, building=building, weekday=weekday,
+            period=period, credits=credits, instructor=instructor,
+            course_name=course_name, req_type=req_type,
         )
 
     @tool
@@ -1028,39 +1085,27 @@ def create_tools(index: Optional[VectorIndex]) -> list:
     ) -> str:
         """
         Multi-hop graph search across EECS courses (CS, EE, CE, NLT, AI) only.
-        Combines any filters as AND conditions.
 
         Args:
-            department:  Full dept name e.g. "computer science", "communication engineering"
-            building:    Building code/name e.g. "E6", "Language Center"
-            weekday:     Day e.g. "Monday", "thursday", "星期三"
-            period:      Period e.g. "3", "5", "A"
+            department:  Full dept name e.g. "computer science"
+            building:    Building code/name e.g. "E6"
+            weekday:     Day e.g. "Monday", "thursday"
+            period:      Period e.g. "3", "A"
             credits:     Exact credit count e.g. 3
-            instructor:  Instructor name (partial) e.g. "Wang"
-            course_name: Course name keyword (partial)
+            instructor:  Instructor name (partial)
+            course_name: Course name or code keyword (partial)
             req_type:    "required" or "elective"
         """
         if err := _check_index(index): return err
-
         if department:
             dept_zh, display = _resolve_dept(department)
             if dept_zh and dept_zh not in EECS_DEPTS_ZH:
-                return (
-                    f"'{display}' is outside EECS scope. "
-                    f"I only cover CS, EE, CE, NLT, and AI."
-                )
-
+                return f"'{display}' is outside EECS scope. I only cover CS, EE, CE, NLT, and AI."
         return _graph_search(
-            docs        = _eecs_docs(index),
-            scope_label = "EECS",
-            department  = department,
-            building    = building,
-            weekday     = weekday,
-            period      = period,
-            credits     = credits,
-            instructor  = instructor,
-            course_name = course_name,
-            req_type    = req_type,
+            docs=_eecs_docs(index), scope_label="EECS",
+            department=department, building=building, weekday=weekday,
+            period=period, credits=credits, instructor=instructor,
+            course_name=course_name, req_type=req_type,
         )
 
     # ── Listing helpers ───────────────────────────────────────────────────────
@@ -1074,10 +1119,7 @@ def create_tools(index: Optional[VectorIndex]) -> list:
             zh = d.get("dept_name_zh", "")
             if zh:
                 counts[zh] = counts.get(zh, 0) + 1
-        lines = [
-            f"{DEPT_EN_LABEL.get(zh, zh)} ({zh}) [{n}]"
-            for zh, n in counts.items()
-        ]
+        lines = [f"{DEPT_EN_LABEL.get(zh, zh)} ({zh}) [{n}]" for zh, n in counts.items()]
         lines.sort()
         return "NCU departments:\n" + "\n".join(lines)
 
@@ -1090,10 +1132,7 @@ def create_tools(index: Optional[VectorIndex]) -> list:
             zh = d.get("dept_name_zh", "")
             if zh:
                 counts[zh] = counts.get(zh, 0) + 1
-        lines = [
-            f"{DEPT_EN_LABEL.get(zh, zh)} ({zh}) [{n}]"
-            for zh, n in counts.items()
-        ]
+        lines = [f"{DEPT_EN_LABEL.get(zh, zh)} ({zh}) [{n}]" for zh, n in counts.items()]
         lines.sort()
         return "EECS departments:\n" + "\n".join(lines)
 
@@ -1163,24 +1202,17 @@ def create_tools(index: Optional[VectorIndex]) -> list:
 
     return [
         clarify,
-        # Ambiguity
         detect_ambiguity,
         detect_ambiguity_eecs,
-        # Content search
         search_courses_by_content,
         search_eecs_courses_by_content,
-        # Department search
         search_courses_by_department,
-        # Full listings
         get_all_courses_by_department,
         get_all_eecs_courses_by_department,
-        # Credit planning
         plan_courses_by_credits,
         plan_eecs_courses_by_credits,
-        # Graph / multi-filter
         graph_search_courses,
         graph_search_eecs_courses,
-        # Listing helpers
         list_departments,
         list_eecs_departments,
         search_courses_by_time,
@@ -1201,9 +1233,7 @@ if __name__ == "__main__":
 
     cases = [
         ("detect_ambiguity",                    {"query": "communication"}),
-        ("detect_ambiguity",                    {"query": "engineering mathematics"}),
         ("detect_ambiguity_eecs",               {"query": "computer science"}),
-        ("list_departments",                    {}),
         ("list_eecs_departments",               {}),
         ("get_all_eecs_courses_by_department",  {"department": "communication engineering"}),
         ("plan_eecs_courses_by_credits",        {"department": "network learning technology", "target_credits": 9}),

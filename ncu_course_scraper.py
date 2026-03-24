@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 DATA_DIR      = Path("data")
 OUT_EN        = DATA_DIR / "courses_en.jsonl"
 OUT_ZH        = DATA_DIR / "courses_zh.jsonl"
-OUT_COMBINED  = DATA_DIR / "courses_combined.jsonl"   # bilingual prose — best for embedding
+OUT_COMBINED  = DATA_DIR / "courses_combined.jsonl"
 OUT_RAW       = DATA_DIR / "courses_raw.jsonl"
 OUT_TIMESLOT  = DATA_DIR / "timeslot_lookup.json"
 OUT_BUILDING  = DATA_DIR / "building_lookup.json"
@@ -92,7 +92,14 @@ TIMESLOT_LOOKUP: dict[str, dict] = {
 }
 
 WEEKDAY_ZH_TO_EN: dict[str, str] = {
-    "日": "Sunday",  "一": "Monday",   "二": "Tuesday",
+    "日": "sunday",  "一": "monday",    "二": "tuesday",
+    "三": "wednesday","四": "thursday", "五": "friday",  "六": "saturday",
+}
+
+# FIX: store lowercase to match what _metadata() produces and what tools.py
+# WEEKDAY_NORM expects — avoids the title-case mismatch bug.
+WEEKDAY_ZH_TO_EN_DISPLAY: dict[str, str] = {
+    "日": "Sunday",  "一": "Monday",    "二": "Tuesday",
     "三": "Wednesday","四": "Thursday", "五": "Friday",  "六": "Saturday",
 }
 
@@ -147,7 +154,7 @@ REQUIRED_ELECTIVE_MAP: dict[str, dict] = {
 @dataclass
 class ScheduleSlot:
     weekday_zh: str
-    weekday_en: str
+    weekday_en: str   # lowercase e.g. "monday" — matches metadata filter keys
     periods:    list[str]
     times:      list[str]
     classroom:  str = ""
@@ -158,7 +165,10 @@ class ScheduleSlot:
         times_str = ", ".join(self.times)
         room = f" in room {self.classroom}" if self.classroom else ""
         bld  = f" ({self.building_en})"     if self.building_en else ""
-        return f"{self.weekday_en} periods {','.join(self.periods)} ({times_str}){room}{bld}"
+        return (
+            f"{self.weekday_en.title()} periods {','.join(self.periods)}"
+            f" ({times_str}){room}{bld}"
+        )
 
     def text_zh(self) -> str:
         times_str = "、".join(self.times)
@@ -188,9 +198,12 @@ class Course:
     schedule_slots:       list[ScheduleSlot] = field(default_factory=list)
     dept_code_prefix:     str = ""
 
-    # ── Shared metadata dict used by all index doc builders ──────────────────
     def _metadata(self) -> dict:
-        """Structured fields used for filtering — independent of text format."""
+        """
+        Structured fields for filtering.
+        weekdays stored as lowercase English e.g. ["monday", "wednesday"]
+        to match WEEKDAY_NORM in tools.py.
+        """
         return {
             "course_code":    self.course_code,
             "course_name":    self.course_name_en or self.course_name_zh,
@@ -204,67 +217,66 @@ class Course:
             "enrollment":     self.enrollment_limit,
             "classrooms":     list({s.classroom    for s in self.schedule_slots if s.classroom}),
             "buildings":      list({s.building_en  for s in self.schedule_slots if s.building_en}),
-            "weekdays":       list({s.weekday_en.lower() for s in self.schedule_slots}),
+            # FIX: weekday_en is now always lowercase so filtering works without normalisation
+            "weekdays":       list({s.weekday_en   for s in self.schedule_slots if s.weekday_en}),
             "periods":        list({p for s in self.schedule_slots for p in s.periods}),
+            # FIX: include per-slot schedule detail for tools.py _extract_schedule_lines
+            "schedule":       [
+                {
+                    "weekday":    s.weekday_en,
+                    "weekday_zh": s.weekday_zh,
+                    "periods":    s.periods,
+                    "times":      s.times,
+                    "classroom":  s.classroom,
+                    "building":   s.building_en,
+                    "building_zh":s.building_zh,
+                }
+                for s in self.schedule_slots
+            ],
             "course_url":     self.course_url,
         }
 
     # ── Prose text builders ───────────────────────────────────────────────────
 
     def to_rag_text_en(self) -> str:
-        """
-        Natural prose in English — better for embedding than label-colon format.
-
-        Example output:
-          Engineering Mathematics (工程數學) is a 3-credit required course [I2010]
-          offered by the Department of Computer Science and Engineering (資訊工程學系).
-          It is taught by Wang Ming and meets on Monday and Wednesday,
-          periods 3 and 4 (10:00–11:50) in room E6-A207 (Engineering Building 7).
-        """
         name_en = self.course_name_en or self.course_name_zh
         name_zh = self.course_name_zh
 
-        # ── Opening sentence ─────────────────────────────────────────────────
         bilingual_name = (
             f"{name_en} ({name_zh})" if name_en and name_zh and name_en != name_zh
             else name_en
         )
-        code_part = f" [{self.course_code}]" if self.course_code else ""
-        credits_part = (
-            f"{self.credits}-credit " if self.credits else ""
-        )
-        req_part = (
-            self.required_elective_en.lower() + " " if self.required_elective_en else ""
-        )
-        opening = f"{bilingual_name}{code_part} is a {credits_part}{req_part}course"
+        code_part    = f" [{self.course_code}]" if self.course_code else ""
+        credits_part = f"{self.credits}-credit " if self.credits else ""
+        req_part     = self.required_elective_en.lower() + " " if self.required_elective_en else ""
+        opening      = f"{bilingual_name}{code_part} is a {credits_part}{req_part}course"
 
-        # ── Department ───────────────────────────────────────────────────────
         if self.dept_name_zh:
             opening += f" offered by {self.dept_name_zh}"
-
         opening += "."
 
-        # ── Instructor sentence ───────────────────────────────────────────────
-        instructor_sent = ""
-        if self.instructor:
-            instructor_sent = f" It is taught by {self.instructor}."
+        instructor_sent = f" It is taught by {self.instructor}." if self.instructor else ""
 
-        # ── Schedule sentence ─────────────────────────────────────────────────
         schedule_sent = ""
         if self.schedule_slots:
             slot_phrases = []
             for s in self.schedule_slots:
-                periods_str  = " and ".join(s.periods) if len(s.periods) > 1 else (s.periods[0] if s.periods else "")
-                time_range   = f"{s.times[0].split('-')[0]}–{s.times[-1].split('-')[1]}" if s.times else ""
-                room_phrase  = f" in room {s.classroom}" if s.classroom else ""
-                bld_phrase   = f" ({s.building_en})"     if s.building_en else ""
+                periods_str = (
+                    " and ".join(s.periods) if len(s.periods) > 1
+                    else (s.periods[0] if s.periods else "")
+                )
+                time_range  = (
+                    f"{s.times[0].split('-')[0]}–{s.times[-1].split('-')[1]}"
+                    if s.times else ""
+                )
+                room_phrase = f" in room {s.classroom}" if s.classroom else ""
+                bld_phrase  = f" ({s.building_en})"     if s.building_en else ""
                 slot_phrases.append(
-                    f"{s.weekday_en} period{'s' if len(s.periods) != 1 else ''} "
+                    f"{s.weekday_en.title()} period{'s' if len(s.periods) != 1 else ''} "
                     f"{periods_str} ({time_range}){room_phrase}{bld_phrase}"
                 )
             schedule_sent = " The course meets " + "; and ".join(slot_phrases) + "."
 
-        # ── Enrollment / notes ────────────────────────────────────────────────
         extra_parts = []
         if self.enrollment_limit:
             extra_parts.append(f"enrollment limit {self.enrollment_limit}")
@@ -277,14 +289,6 @@ class Course:
         return opening + instructor_sent + schedule_sent + extra_sent
 
     def to_rag_text_zh(self) -> str:
-        """
-        Natural prose in Chinese — mirrors to_rag_text_en() structure.
-
-        Example output:
-          工程數學（Engineering Mathematics）[I2010] 是資訊工程學系開設的
-          3學分必修課，由王明老師授課。本課程於每週一及週三第3、4節
-          （10:00–11:50）在E6-A207教室（工程七館）上課。
-        """
         name_zh = self.course_name_zh
         name_en = self.course_name_en
         bilingual_name = (
@@ -292,35 +296,35 @@ class Course:
             else name_zh or name_en
         )
         code_part   = f"[{self.course_code}]" if self.course_code else ""
-        credits_str = f"{self.credits}學分" if self.credits else ""
+        credits_str = f"{self.credits}學分"   if self.credits else ""
         req_str     = self.required_elective_zh if self.required_elective_zh else ""
 
-        # Opening
         type_str = "、".join(filter(None, [credits_str, req_str]))
-        opening = f"{bilingual_name}{code_part}"
-        if self.dept_name_zh:
-            opening += f" 是{self.dept_name_zh}開設的{type_str}課程。"
-        else:
-            opening += f" 是{type_str}課程。"
+        opening  = f"{bilingual_name}{code_part}"
+        opening += (
+            f" 是{self.dept_name_zh}開設的{type_str}課程。"
+            if self.dept_name_zh
+            else f" 是{type_str}課程。"
+        )
 
-        # Instructor
         instructor_sent = f"本課程由{self.instructor}老師授課。" if self.instructor else ""
 
-        # Schedule
         schedule_sent = ""
         if self.schedule_slots:
             slot_phrases = []
             for s in self.schedule_slots:
                 periods_str = "、".join(s.periods)
-                time_range  = f"{s.times[0].split('-')[0]}–{s.times[-1].split('-')[1]}" if s.times else ""
-                room_phrase = f"在{s.classroom}教室"    if s.classroom else ""
-                bld_phrase  = f"（{s.building_zh}）"    if s.building_zh else ""
+                time_range  = (
+                    f"{s.times[0].split('-')[0]}–{s.times[-1].split('-')[1]}"
+                    if s.times else ""
+                )
+                room_phrase = f"在{s.classroom}教室"  if s.classroom else ""
+                bld_phrase  = f"（{s.building_zh}）"  if s.building_zh else ""
                 slot_phrases.append(
                     f"每週{s.weekday_zh}第{periods_str}節（{time_range}）{room_phrase}{bld_phrase}"
                 )
-                schedule_sent = "上課時間為" + "；".join(slot_phrases) + "。"
+            schedule_sent = "上課時間為" + "；".join(slot_phrases) + "。"
 
-        # Extra
         extra_parts = []
         if self.enrollment_limit:
             extra_parts.append(f"人數限制{self.enrollment_limit}人")
@@ -333,13 +337,6 @@ class Course:
         return opening + instructor_sent + schedule_sent + extra_sent
 
     def to_rag_text_combined(self) -> str:
-        """
-        Bilingual prose document — recommended for embedding.
-
-        Merges English and Chinese prose with a separator so one vector
-        captures both language representations. Cross-lingual queries
-        (Chinese question → English-named course) resolve more reliably.
-        """
         return self.to_rag_text_en() + "\n\n" + self.to_rag_text_zh()
 
     # ── Index doc builders ────────────────────────────────────────────────────
@@ -348,15 +345,15 @@ class Course:
         return {"text": self.to_rag_text_en(), **self._metadata()}
 
     def to_index_doc_zh(self) -> dict:
-        # Override a few metadata fields with ZH-specific values
         meta = self._metadata()
-        meta["buildings"] = list({s.building_zh for s in self.schedule_slots if s.building_zh})
-        meta["weekdays"]  = list({s.weekday_zh  for s in self.schedule_slots})
-        meta["course_name"] = self.course_name_zh
+        # Override display fields only — keep weekdays as lowercase EN for filtering
+        meta["buildings_zh"] = list({s.building_zh for s in self.schedule_slots if s.building_zh})
+        meta["weekdays_zh"]  = list({s.weekday_zh  for s in self.schedule_slots})
+        meta["course_name"]  = self.course_name_zh
         return {"text": self.to_rag_text_zh(), **meta}
 
     def to_index_doc_combined(self) -> dict:
-        """Best document for embedding — bilingual prose + full EN metadata."""
+        """Best document for embedding — bilingual prose + full metadata."""
         return {"text": self.to_rag_text_combined(), **self._metadata()}
 
     def to_raw_dict(self) -> dict:
@@ -389,17 +386,79 @@ def resolve_building(classroom: str) -> tuple[str, str]:
 
 
 def parse_periods_and_classroom(cell_text: str) -> tuple[list[str], str]:
+    """
+    Parse a day-column cell that contains period codes and optionally a classroom.
+
+    Cell formats seen in the wild:
+      "34"              → periods [3,4], no classroom
+      "3\n4"            → periods [3,4], no classroom
+      "34\nE6-A207"     → periods [3,4], classroom "E6-A207"
+      "E6-A207\n34"     → same
+      "3A"              → periods [3,A]  (mixed digit+letter)
+    """
     lines     = [l.strip() for l in cell_text.strip().splitlines() if l.strip()]
     periods:  list[str] = []
     classroom = ""
+
     for line in lines:
+        # Pure period string: one or more of 1-9, A-D, Z (case-insensitive)
         if re.fullmatch(r"[1-9A-DZa-dz]+", line):
             periods = list(line.upper())
-        elif re.match(r"^[A-Za-z0-9]", line) and not re.fullmatch(r"\d+", line):
+        # Classroom: starts with a letter or digit, contains a dash or letter mix
+        # (excludes pure-digit strings that could be mistaken for serials)
+        elif re.match(r"^[A-Za-z0-9]", line) and not re.fullmatch(r"\d{1,2}", line):
             classroom = line
-        elif re.fullmatch(r"\d+", line) and all(d in "123456789" for d in line):
-            periods = list(line)
+
     return periods, classroom
+
+
+def parse_timecls_column(timecls: str) -> list[tuple[str, list[str], list[str], str, str, str]]:
+    """
+    Parse a combined 時間/教室 cell that encodes multiple day+period+room slots.
+
+    Returns list of (weekday_zh, periods, times, classroom, building_en, building_zh).
+
+    Handles formats:
+      "三34 E6-A207"          — day, periods, space, classroom
+      "三34/E6-A207"          — slash separator
+      "三34\nE6-A207"         — newline separator
+      "三34 四56 E6-B101"     — multiple days, shared room
+      "三34E6-A207四56E1-101" — no separator (trickier)
+    """
+    results = []
+
+    # Normalise whitespace and slash variants
+    text = re.sub(r"[／/]", " ", timecls).strip()
+
+    # Strategy: find each occurrence of a day character followed immediately by
+    # period codes, then optionally followed by a classroom token.
+    # Pattern explanation:
+    #   ([一二三四五六日])   — day character
+    #   ([1-9A-DZa-dz]+)    — one or more period codes
+    #   (?:\s+|\b)           — optional whitespace boundary
+    #   ([\w][\w\-\.]*)?     — optional classroom (starts with alnum, may contain - or .)
+    #
+    # We use finditer and check the next token for classroom separately.
+
+    slot_pattern = re.compile(
+        r"([一二三四五六日])"          # day
+        r"([1-9A-DZa-dz]+)"          # periods
+        r"(?:"                        # optional classroom group
+        r"[\s/]+"                     # separator
+        r"((?:[A-Za-z][A-Za-z0-9\-\.]*\d[\w\-\.]*)|(?:\d{2}[\w\-\.]+))"  # classroom token
+        r")?"
+    )
+
+    for m in slot_pattern.finditer(text):
+        day_char   = m.group(1)
+        period_str = m.group(2).upper()
+        classroom  = (m.group(3) or "").strip()
+        periods    = list(period_str)
+        bld_en, bld_zh = resolve_building(classroom)
+        times = [TIMESLOT_LOOKUP.get(p, {}).get("time", p) for p in periods]
+        results.append((day_char, periods, times, classroom, bld_en, bld_zh))
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -525,7 +584,6 @@ def _parse_name_cell(cell: Tag) -> tuple[str, str, str, str]:
         course_url = (BASE_URL + href) if href.startswith("/") else href
 
     raw_lines = [_clean(t) for t in cell.stripped_strings]
-    noise     = {"密碼卡", "預選", "採用密碼卡", "部份使用", "全部使用", "[預選]"}
 
     name_zh, name_en, notes_parts = "", "", []
     for line in raw_lines:
@@ -555,9 +613,8 @@ def parse_department_table(soup: BeautifulSoup, dept: dict) -> list[Course]:
     if not rows:
         return []
 
-    # Build column index
-    header_cells   = rows[0].find_all(["th", "td"])
-    col_keys:      list[str]      = []
+    header_cells    = rows[0].find_all(["th", "td"])
+    col_keys:       list[str]      = []
     day_col_indices: dict[int, str] = {}
 
     for idx, cell in enumerate(header_cells):
@@ -621,10 +678,13 @@ def parse_department_table(soup: BeautifulSoup, dept: dict) -> list[Course]:
         schedule_slots: list[ScheduleSlot] = []
 
         if has_day_cols:
+            # Table has one column per weekday
             for col_idx, day_char in day_col_indices.items():
                 if col_idx >= len(cells):
                     continue
-                cell_text = _clean(cells[col_idx].get_text())
+                # Use get_text with separator to preserve newlines between sub-elements
+                cell_el   = cells[col_idx]
+                cell_text = cell_el.get_text(separator="\n").strip()
                 if not cell_text:
                     continue
                 periods, classroom = parse_periods_and_classroom(cell_text)
@@ -632,9 +692,10 @@ def parse_department_table(soup: BeautifulSoup, dept: dict) -> list[Course]:
                     continue
                 bld_en, bld_zh = resolve_building(classroom)
                 times = [TIMESLOT_LOOKUP.get(p, {}).get("time", p) for p in periods]
+                # FIX: store lowercase weekday_en
                 schedule_slots.append(ScheduleSlot(
                     weekday_zh  = day_char,
-                    weekday_en  = WEEKDAY_ZH_TO_EN.get(day_char, day_char),
+                    weekday_en  = WEEKDAY_ZH_TO_EN[day_char],   # lowercase
                     periods     = periods,
                     times       = times,
                     classroom   = classroom,
@@ -642,23 +703,26 @@ def parse_department_table(soup: BeautifulSoup, dept: dict) -> list[Course]:
                     building_zh = bld_zh,
                 ))
         else:
+            # Combined 時間/教室 column — use the new robust parser
             timecls = txt("timecls")
-            for m in re.finditer(r"([一二三四五六日])([1-9A-DZa-dz]+)[/／\s]*([\w\-]+)?", timecls):
-                day_char   = m.group(1)
-                period_str = m.group(2).upper()
-                classroom  = (m.group(3) or "").strip()
-                periods    = list(period_str)
-                bld_en, bld_zh = resolve_building(classroom)
-                times = [TIMESLOT_LOOKUP.get(p, {}).get("time", p) for p in periods]
-                schedule_slots.append(ScheduleSlot(
-                    weekday_zh  = day_char,
-                    weekday_en  = WEEKDAY_ZH_TO_EN.get(day_char, day_char),
-                    periods     = periods,
-                    times       = times,
-                    classroom   = classroom,
-                    building_en = bld_en,
-                    building_zh = bld_zh,
-                ))
+            if timecls:
+                for day_char, periods, times, classroom, bld_en, bld_zh in \
+                        parse_timecls_column(timecls):
+                    schedule_slots.append(ScheduleSlot(
+                        weekday_zh  = day_char,
+                        weekday_en  = WEEKDAY_ZH_TO_EN.get(day_char, day_char),  # lowercase
+                        periods     = periods,
+                        times       = times,
+                        classroom   = classroom,
+                        building_en = bld_en,
+                        building_zh = bld_zh,
+                    ))
+
+        if schedule_slots:
+            logger.debug(
+                f"  Course {code} {name_zh}: "
+                f"{[f'{s.weekday_en} {s.periods}' for s in schedule_slots]}"
+            )
 
         courses.append(Course(
             dept_id              = dept["id"],
@@ -742,22 +806,34 @@ def main(single_dept: str | None = None, delay: float = DEFAULT_DELAY) -> None:
         logger.error("No courses scraped.")
         sys.exit(1)
 
-    # courses_combined.jsonl is the primary embedding target
     write_jsonl(OUT_COMBINED, (c.to_index_doc_combined() for c in all_courses))
     write_jsonl(OUT_EN,       (c.to_index_doc_en()       for c in all_courses))
     write_jsonl(OUT_ZH,       (c.to_index_doc_zh()       for c in all_courses))
     write_jsonl(OUT_RAW,      (c.to_raw_dict()            for c in all_courses))
 
+    # ── Post-scrape sanity check ──────────────────────────────────────────────
+    courses_with_schedule  = sum(1 for c in all_courses if c.schedule_slots)
+    courses_with_weekday   = sum(
+        1 for c in all_courses
+        if any(s.weekday_en for s in c.schedule_slots)
+    )
+    logger.info(
+        f"Schedule coverage: {courses_with_schedule}/{len(all_courses)} courses "
+        f"have slots; {courses_with_weekday} have weekday data"
+    )
+
     write_json(OUT_REPORT, {
-        "total_departments": len(depts),
-        "failed_count":      len(failed_depts),
-        "total_courses":     len(all_courses),
-        "failed_departments": failed_depts,
+        "total_departments":   len(depts),
+        "failed_count":        len(failed_depts),
+        "total_courses":       len(all_courses),
+        "courses_with_schedule": courses_with_schedule,
+        "failed_departments":  failed_depts,
     })
 
     print(f"\n{'─'*55}")
     print(f"  Departments : {len(depts) - len(failed_depts)} OK / {len(depts)} total")
     print(f"  Courses     : {len(all_courses)}")
+    print(f"  With schedule: {courses_with_schedule}")
     if failed_depts:
         print(f"  Failed      : {len(failed_depts)}  (see {OUT_REPORT.name})")
     print(f"{'─'*55}")

@@ -2,5 +2,6 @@
   "total_departments": 5,
   "failed_count": 0,
   "total_courses": 189,
+  "courses_with_schedule": 0,
   "failed_departments": []
 }

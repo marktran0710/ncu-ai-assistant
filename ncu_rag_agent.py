@@ -58,6 +58,9 @@ THINK_TAG_RE        = re.compile(r"<think>.*?</think>", re.DOTALL)
 # Max non-system messages kept in conversation history (10 exchanges = 20 msgs)
 MAX_HISTORY_MESSAGES = 20
 
+# Max tool output length stored in state (prevents state bloat)
+MAX_TOOL_OUTPUT_CHARS = 4000
+
 # ── Prompts ───────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """\
@@ -107,7 +110,7 @@ Respond in the same language as the user.
 PLAN_PROMPT = """\
 You are a query planner for an NCU EECS course assistant.
 
-Given a user question, produce an execution plan as a JSON array.
+Given a user question (and optional recent conversation context), produce an execution plan as a JSON array.
 Each step has: {{"tool": "<tool_name>", "args": {{...}}, "reason": "<why>"}}
 
 Rules:
@@ -121,6 +124,10 @@ Rules:
 - Maximum 3 steps. Most queries need only 1.
 - Never include a synthesise step — that is done separately.
 - Omit optional args that are not needed (do not emit null values).
+- If the user references a course code like [CO6063] or SE6032, extract it and pass it
+  as course_name in graph_search_eecs_courses (it will match by code).
+- If recent conversation already identified a specific course, use that context to
+  avoid re-searching broadly. Prefer the specific course code or name.
 
 Available tools and signatures:
   detect_ambiguity_eecs(query: str)
@@ -160,15 +167,24 @@ Examples:
   Q: "where is Engineering Mathematics"
   A: [{{"tool":"graph_search_eecs_courses","args":{{"course_name":"Engineering Mathematics"}},"reason":"find EECS course location"}}]
 
-User question: {question}
+  Q: "[CO6063] schedule" (or after user already mentioned CO6063 in conversation)
+  A: [{{"tool":"graph_search_eecs_courses","args":{{"course_name":"CO6063"}},"reason":"direct lookup by course code"}}]
+
+{context_block}User question: {question}
 """
 
 SYNTHESISE_PROMPT = """\
 You are the NCU EECS Course Assistant. Answer the user's question using ONLY the tool results below.
 
 Rules:
-- Use ONLY data from tool results. Never guess or invent.
-- List courses as: [CODE] Name — N credits (Type)
+- Use ONLY data from tool results. Never guess or invent information.
+- Answer DIRECTLY and COMPLETELY. Never ask the user follow-up clarifying questions.
+- Always show UP TO 5 related results when multiple courses are found.
+- If schedule/time/location data is present in results, you MUST display it. Do not withhold it.
+- Format each course as:
+    [CODE] Name — N credits (Type) | Instructor: X
+    📅 {Weekday} Periods {X,Y} ({time range}) | Room {classroom} ({building})
+- If only one course matches and the user asked about its schedule, show the full schedule immediately.
 - If no data found, say so clearly.
 - If clarification was needed, present the options to the user.
 - Respond in the same language as the user's question.
@@ -289,15 +305,42 @@ def _handle_error(err: str) -> tuple[bool, int, str | None]:
         return True, RETRY_WAIT_OTHER, None
     return False, 0, None
 
+
+def build_conversation_context(conversation: list[BaseMessage], n_turns: int = 3) -> str:
+    """
+    Extract the last n_turns of Human/AI exchanges as a plain-text context block.
+    Used to give the planner awareness of what was already discussed.
+    """
+    recent = [
+        m for m in conversation
+        if isinstance(m, (HumanMessage, AIMessage))
+    ][-(n_turns * 2):]   # 2 messages per turn
+
+    if not recent:
+        return ""
+
+    lines = []
+    for m in recent:
+        role = "User" if isinstance(m, HumanMessage) else "Assistant"
+        # Truncate individual messages so the context block stays compact
+        content = m.content[:300].replace("\n", " ")
+        lines.append(f"{role}: {content}")
+
+    return "Recent conversation:\n" + "\n".join(lines) + "\n\n"
+
 # ── Plan-then-Execute nodes ───────────────────────────────────────────────────
 
 def make_planner_node(planner_model: ChatOpenAI):
-    """Node 1: produce a JSON execution plan from the user question."""
+    """Node 1: produce a JSON execution plan from the user question + context."""
     def plan(state: AgentState) -> dict:
         question = state["question"]
         logger.info(f"  [Plan] Generating plan for: {question!r}")
 
-        prompt = PLAN_PROMPT.format(question=question)
+        # Build a short conversation context block so the planner can resolve
+        # references like "that course", "[CO6063]", or "its schedule".
+        context_block = build_conversation_context(state.get("messages", []))
+        prompt = PLAN_PROMPT.format(question=question, context_block=context_block)
+
         try:
             resp = planner_model.invoke([
                 SystemMessage(content="You are a query planner. Output only valid JSON."),
@@ -358,9 +401,10 @@ def make_executor_node(tool_executor: dict):
                 obs, success = f"Tool error: {exc}", False
                 logger.exception(f"Tool failed: {tool_name}")
 
-            obs_str = str(obs)
+            # Cap output size to prevent state/context bloat
+            obs_str = str(obs)[:MAX_TOOL_OUTPUT_CHARS]
             snippet = obs_str[:120].replace("\n", " ")
-            dots    = "…" if len(obs_str) > 120 else ""
+            dots    = "…" if len(str(obs)) > 120 else ""
             print(f"  \033[36m[Result]\033[0m  {snippet}{dots}")
 
             results.append({
@@ -420,8 +464,6 @@ def build_graph(tools: list):
     wf.add_edge("execute", "synthesise")
     wf.add_edge("synthesise", END)
 
-    memory = MemorySaver()
-    # return wf.compile(checkpointer=memory)
     return wf.compile()
 
 # ── REPL ──────────────────────────────────────────────────────────────────────
@@ -466,11 +508,49 @@ def main() -> None:
             print(f"\n\033[32mAssistant:\033[0m {reply}\n")
             continue
 
+        # ── Trim history BEFORE appending, keeping room for the new pair ──────
+        system_msgs = [m for m in conversation if isinstance(m, SystemMessage)]
+        other_msgs  = [m for m in conversation if not isinstance(m, SystemMessage)]
+        conversation = system_msgs + other_msgs[-(MAX_HISTORY_MESSAGES - 2):]
+
         conversation.append(HumanMessage(content=user_input))
 
-        # Fresh state per turn — no cross-turn state pollution
+        # ── Pass only the current turn into graph state (not full history) ────
+        # The planner gets context via build_conversation_context() separately.
+        # Passing full history into an operator.add state causes quadratic growth.
         state: AgentState = {
-            "messages": list(conversation),
+            "messages": [HumanMessage(content=user_input)],
+            "plan":     None,
+            "results":  None,
+            "question": user_input,
+        }
+
+        # Inject recent conversation so the planner node can access it
+        # without polluting the LangGraph state with the full history.
+        state["messages"] = [HumanMessage(content=user_input)]
+        # We pass the trimmed conversation list directly into the planner
+        # by temporarily attaching it to the state under a side-channel key.
+        # Since AgentState uses operator.add on messages, we smuggle context
+        # through the question field as a structured prefix instead:
+        context_preview = build_conversation_context(conversation[:-1])  # exclude just-appended msg
+        if context_preview:
+            # Encode context in the question passed to graph so planner sees it
+            # The planner prompt already handles the context_block formatting.
+            # We store it on state via a workaround: prepend to question for planner,
+            # but keep original question clean for synthesiser.
+            # Better: store conversation on state directly with a non-add field.
+            pass  # handled inside make_planner_node via state["messages"]
+
+        # Cleanest fix: pass recent messages (read-only context) in state["messages"]
+        # The operator.add will append them, but since we start fresh each turn it's fine.
+        # Include last few history messages so planner node can call build_conversation_context.
+        recent_context_msgs = [
+            m for m in conversation[:-1]  # exclude the just-appended HumanMessage
+            if isinstance(m, (HumanMessage, AIMessage))
+        ][-(MAX_HISTORY_MESSAGES):]
+
+        state: AgentState = {
+            "messages": recent_context_msgs + [HumanMessage(content=user_input)],
             "plan":     None,
             "results":  None,
             "question": user_input,
@@ -479,14 +559,7 @@ def main() -> None:
         answered = False
         for attempt in range(1, MAX_REQUEST_RETRIES + 1):
             try:
-                final = app.invoke(
-                    state,
-                    configurable={
-                        "thread_id": "default-thread",
-                        "checkpoint_ns": "ncu-eecs",
-                        "checkpoint_id": f"turn-{attempt}"
-                    }
-                )
+                final = app.invoke(state)
                 answered = True
 
                 ai_msgs = [
@@ -496,7 +569,11 @@ def main() -> None:
                 if ai_msgs:
                     answer = clean(ai_msgs[-1].content)
                     print(f"\n\033[32mAssistant:\033[0m {answer}\n")
+                    # Append AI reply and trim immediately
                     conversation.append(AIMessage(content=answer))
+                    system_msgs = [m for m in conversation if isinstance(m, SystemMessage)]
+                    other_msgs  = [m for m in conversation if not isinstance(m, SystemMessage)]
+                    conversation = system_msgs + other_msgs[-MAX_HISTORY_MESSAGES:]
                 else:
                     results = final.get("results") or []
                     raw = "\n\n".join(r["output"] for r in results if r.get("success"))
@@ -513,6 +590,9 @@ def main() -> None:
                     answer = clean(rescued)
                     print(f"\n\033[32mAssistant:\033[0m {answer}\n")
                     conversation.append(AIMessage(content=answer))
+                    system_msgs = [m for m in conversation if isinstance(m, SystemMessage)]
+                    other_msgs  = [m for m in conversation if not isinstance(m, SystemMessage)]
+                    conversation = system_msgs + other_msgs[-MAX_HISTORY_MESSAGES:]
                     answered = True
                     break
 
@@ -527,14 +607,6 @@ def main() -> None:
 
                 time.sleep(wait)
                 print(f"\033[33m[Retry {attempt}/{MAX_REQUEST_RETRIES}]\033[0m Retrying…")
-
-        if not answered:
-            continue
-
-        # Keep history to last MAX_HISTORY_MESSAGES non-system messages
-        system_msgs = [m for m in conversation if isinstance(m, SystemMessage)]
-        other_msgs  = [m for m in conversation if not isinstance(m, SystemMessage)]
-        conversation = system_msgs + other_msgs[-MAX_HISTORY_MESSAGES:]
 
 
 if __name__ == "__main__":
