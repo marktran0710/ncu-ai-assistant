@@ -181,9 +181,10 @@ Rules:
 - Answer DIRECTLY and COMPLETELY. Never ask the user follow-up clarifying questions.
 - Always show UP TO 5 related results when multiple courses are found.
 - If schedule/time/location data is present in results, you MUST display it. Do not withhold it.
-- Format each course as:
-    [CODE] Name — N credits (Type) | Instructor: X
-    📅 {Weekday} Periods {X,Y} ({time range}) | Room {classroom} ({building})
+- Format each course clearly using the following attributes if available: 
+  Code, Name, Credits, Type, Instructor, Weekday, Periods, Time Range, Room, and Building.
+- Example format: [CODE] Name — N credits (Type) | Instructor: X
+  📅 Weekday, Periods X-Y (Time Range) | Room, Building
 - If only one course matches and the user asked about its schedule, show the full schedule immediately.
 - If no data found, say so clearly.
 - If clarification was needed, present the options to the user.
@@ -420,32 +421,32 @@ def make_executor_node(tool_executor: dict):
 
 
 def make_synthesiser_node(synth_model: ChatOpenAI):
-    """Node 3: synthesise a final answer from all tool results."""
     def synthesise(state: AgentState) -> dict:
         question = state["question"]
-        results  = state.get("results") or []
+        results = state.get("results") or []
 
         if not results:
             answer = "I couldn't find any information. Please try rephrasing your question."
         else:
-            tool_results_text = "\n\n".join(
-                f"[{r['tool']}({r['args']})]\n{r['output']}"
-                for r in results
-            )
-            prompt = SYNTHESISE_PROMPT.format(
-                question=question,
-                tool_results=tool_results_text,
-            )
+            # Pre-process tool results to ensure keys exist or use a safe join
+            tool_results_text = ""
+            for r in results:
+                tool_results_text += f"[{r['tool']}({r['args']})]\n{r['output']}\n\n"
+            
+            # Use .replace or a safe format to avoid KeyError if the LLM output 
+            # contains curly braces that aren't intended for formatting.
+            prompt = SYNTHESISE_PROMPT.replace("{question}", question).replace("{tool_results}", tool_results_text)
+            
             try:
-                resp   = synth_model.invoke([HumanMessage(content=prompt)])
+                resp = synth_model.invoke([HumanMessage(content=prompt)])
                 answer = clean(resp.content).strip()
             except Exception as exc:
                 logger.warning(f"Synthesis failed: {exc}")
-                answer = "\n\n".join(r["output"] for r in results if r["success"])
+                # Fallback: just show the raw data if the LLM fails to format it
+                answer = "I found the following courses but had trouble formatting the summary:\n" 
+                answer += "\n".join(r["output"] for r in results if r["success"])
 
-        logger.info(f"  [Synthesise] Answer length: {len(answer)} chars")
         return {"messages": [AIMessage(content=answer)]}
-
     return synthesise
 
 # ── Graph ─────────────────────────────────────────────────────────────────────
